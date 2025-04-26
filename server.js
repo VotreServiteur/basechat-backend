@@ -7,7 +7,18 @@ const app = express();
 const port = process.env.PORT || 3001;
 
 const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken');
 
+const jwtSecret = process.env.JWT_SECRET || 'testingsecretkey';
+
+const cors = require('cors');
+
+const corsOptions = {
+    origin: 'http://localhost:3000',
+    optionsSuccessStatus: 200
+};
+
+app.use(cors(corsOptions));
 app.use(express.json());
 
 const pool = new Pool({
@@ -77,4 +88,58 @@ app.post('/api/auth/register', async (req, res) => {
         })
     }
 
+})
+
+app.post('/api/auth/login', async (req, res) => {
+    const {login, password} = req.body;
+    if (!login || !password) {
+        return res.status(400).json({
+            success: false,
+            message: 'Login and password are required.'
+        });
+    }
+
+    try {
+        const userResult = await pool.query(
+            'SELECT * FROM users WHERE login = $1',
+            [login]);
+
+        if (userResult.rows.length === 0 ) {
+            return res.status(401).json({
+                success: false,
+                message: 'Invalid login or password.'
+            })
+        }
+        
+        const user = userResult.rows[0];
+
+        const isPasswordValid = await bcrypt.compare(password, user.password);
+        
+        if (!isPasswordValid){
+            return res.status(401).json({
+                success: false,
+                message: 'Invalid login or password.'
+            })
+        }
+
+        const token = jwt.sign(
+            {userId: user.id, login: user.login},
+            jwtSecret,
+            {expiresIn: '1h'}
+        )
+
+        res.status(200).json({
+            success: true,
+            message: 'Login successful',
+            token: token,
+            user: {
+                id: user.id,
+                login: user.login
+            }
+        });
+
+    } catch(err){
+        console.error('Error during login:', err.stack);
+        res.status(500).json({ success: false, message: 'Login failed' });
+    }
 })
