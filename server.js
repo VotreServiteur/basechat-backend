@@ -29,6 +29,29 @@ const pool = new Pool({
     port: process.env.DB_PORT,
 });
 
+function authenticateToken(req, res, next){
+    const authHeader = req.headers['authorization'];
+    const token = authHeader && authHeader.split(' ')[1];
+
+    if (token == null) {
+        return res.status(401).json({success: false, message: 'Authentication token required/'});
+    }
+
+
+    jwt.verify(token, jwtSecret, (err, user) => {
+        if(err){
+            return res.status(403).json({ 
+                success: false,
+                message: 'Invalid token'
+            });
+        }
+
+        req.user = user;
+        next();
+    });
+}
+
+
 pool.connect((err, client, release) => {
     if (err) {
         return console.error('Error acquiring client', err.stack);
@@ -143,3 +166,4 @@ app.post('/api/auth/login', async (req, res) => {
         res.status(500).json({ success: false, message: 'Login failed' });
     }
 })
+
