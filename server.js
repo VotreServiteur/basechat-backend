@@ -2,21 +2,29 @@ require('dotenv').config();
 
 const express = require('express');
 const { Pool } = require('pg');
-
+const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken');
+const cors = require('cors');
+const WebSocket = require('ws');
+const http = require('http');
 const app = express();
 const port = process.env.PORT || 3001;
 
-const bcrypt = require('bcryptjs');
-const jwt = require('jsonwebtoken');
+const server = http.createServer(app);
+
+const wss = new WebSocket.Server({ server });
 
 const jwtSecret = process.env.JWT_SECRET || 'testingsecretkey';
 
-const cors = require('cors');
 
 const corsOptions = {
     origin: 'http://localhost:3000',
     optionsSuccessStatus: 200
 };
+
+
+
+
 
 app.use(cors(corsOptions));
 app.use(express.json());
@@ -50,6 +58,33 @@ function authenticateToken(req, res, next) {
         next();
     });
 }
+
+
+const connectedClients = new Set();
+
+wss.on('connection', ws => {
+    console.log('Client connected via WebSocket');
+
+    connectedClients.add(ws);
+
+    ws.on('message', message => {
+        console.log(`Received message from client: ${message}`);
+    });
+
+    ws.on('close', () => {
+        console.log('Client disconnected from WebSocket');
+        connectedClients.delete(ws);
+    });
+
+
+    ws.on('error', error => {
+        console.log(`WebSocket error: ${error}`);
+        connectedClients.delete(ws);
+    });
+
+
+    
+})
 
 
 app.post('/api/auth/register', async (req, res) => {
@@ -185,8 +220,7 @@ app.post('/api/messages', authenticateToken, async (req, res) => {
         return res.status(400).json({ success: false, message: 'message text can not be empty'});
     }
     const chatId = 1;
-    recieving
-
+    
     try {
         const result = await pool.query(
             'INSERT INTO messages (chat_id, sender_id, text) VALUES ($1,$2,$3) RETURNING id, chat_id, sender_id, text, created_at',
@@ -197,17 +231,25 @@ app.post('/api/messages', authenticateToken, async (req, res) => {
         const senderResult = await pool.query('SELECT login FROM users WHERE id = $1', [senderId]);
         const senderLogin = senderResult.rows[0].login;
 
+        const messageDataToBroadcast = {
+            id: newMessage.id,
+            chat_id: newMessage.chat_id,
+            sender_id: newMessage.sender_id,
+            text: newMessage.text,
+            created_at: newMessage.created_at,
+            sender_login: senderLogin
+        }
+
+        connectedClients.forEach(client => {
+            if (client.readyState === WebSocket.OPEN) {
+                client.send(JSON.stringify(messageDataToBroadcast));
+            }
+        })
+
         res.status(201).json({
             success: true,
             message: 'Message sent successfully',
-            messageData: {
-                id: newMessage.id,
-                chat_id: newMessage.chat_id,
-                sender_id: newMessage.sender_id,
-                text: newMessage.text,
-                created_at: newMessage.created_at,
-                sender_login: senderLogin
-            }
+            messageData: messageDataToBroadcast
         })
 
     }catch (err){
@@ -228,6 +270,6 @@ app.get('/', (req, res) => {
     res.send('Back is running');
 })
 
-app.listen(port, () => {
-    console.log(`Server running on port ${port}`);
+server.listen(port, () => {
+    console.log(`HTTP and WebSocket server running on port ${port}`);
 });
