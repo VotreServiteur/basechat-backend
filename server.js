@@ -83,7 +83,7 @@ wss.on('connection', ws => {
     });
 
 
-    
+
 })
 
 
@@ -210,17 +210,17 @@ app.get(
             res.status(500).json({ success: false, message: 'Failed to fetch messages' });
 
         }
-});
+    });
 
 app.post('/api/messages', authenticateToken, async (req, res) => {
     const senderId = req.user.userId;
     const { text } = req.body;
 
-    if (!text || text.trim().length === 0){
-        return res.status(400).json({ success: false, message: 'message text can not be empty'});
+    if (!text || text.trim().length === 0) {
+        return res.status(400).json({ success: false, message: 'message text can not be empty' });
     }
     const chatId = 1;
-    
+
     try {
         const result = await pool.query(
             'INSERT INTO messages (chat_id, sender_id, text) VALUES ($1,$2,$3) RETURNING id, chat_id, sender_id, text, created_at',
@@ -240,9 +240,14 @@ app.post('/api/messages', authenticateToken, async (req, res) => {
             sender_login: senderLogin
         }
 
+        const new_message_notification = {
+            type: 'new_message',          
+            messageData: messageDataToBroadcast 
+        };
+
         connectedClients.forEach(client => {
             if (client.readyState === WebSocket.OPEN) {
-                client.send(JSON.stringify(messageDataToBroadcast));
+                client.send(JSON.stringify(new_message_notification));
             }
         })
 
@@ -252,11 +257,139 @@ app.post('/api/messages', authenticateToken, async (req, res) => {
             messageData: messageDataToBroadcast
         })
 
-    }catch (err){
+    } catch (err) {
         console.error('Error sending message:', err.stack);
-        res.status(500).json({ success: false, message: 'Failed to send message'});
+        res.status(500).json({ success: false, message: 'Failed to send message' });
     }
 });
+
+
+app.delete('/api/messages/:id', authenticateToken, async (req, res) => {
+    const messageId = req.params.id;
+    const userId = req.user.userId;
+
+
+    try {
+        const messageResult = await pool.query(
+            'SELECT sender_id FROM messages WHERE id = $1',
+            [messageId]
+        );
+
+        if (messageResult.rows.length === 0) {
+            return res.status(404).json({
+                success: false,
+                message: 'Message not found'
+            })
+        }
+
+        const message = messageResult.rows[0];
+
+        if (message.sender_id !== userId) {
+            return res.status(403).json({
+                success: false,
+                message: 'You can only delete your own messages'
+            })
+        }
+
+        await pool.query('DELETE FROM messages WHERE id = $1', [messageId]);
+
+        const deleteNotification = {
+            type: 'message_deleted',
+            messageId: messageId
+        };
+
+        connectedClients.forEach(client => {
+            if (client.readyState === WebSocket.OPEN){
+                client.send(JSON.stringify(deleteNotification));
+            }
+        });
+
+        res.status(200).json({
+            success: true,
+            message: 'Message deleted successfully',
+            id: messageId
+        })
+
+    } catch (err) {
+        console.error('Error deleting message:', err.stack);
+        res.status(500).json({
+            success: false,
+            message: 'Failed to delete message'
+        })
+    }
+})
+
+app.put('/api/messages/:id', authenticateToken, async (req, res) => {
+    const messageId = req.params.id;
+    const userId = req.user.userId;
+    const { text } = req.body;
+
+    if (!text || text.trim().length === 0) {
+        return res.status(400).json({
+            success: false,
+            message: 'New message text can not be empty'
+        })
+    }
+
+    try {
+        const messageResult = await pool.query(
+            'SELECT sender_id FROM messages WHERE id = $1',
+            [messageId]
+        );
+
+        if (messageResult.rows.length === 0) {
+            return res.status(404).json({
+                success: false,
+                success: false,
+                message: 'Message not found'
+            })
+
+        }
+
+        const message = messageResult.rows[0];
+
+        if (message.sender_id !== userId) {
+            return res.status(403).json({
+                success: false,
+                message: 'You can only your messages'
+            })
+        }
+
+        const updateResult = await pool.query(
+            'UPDATE messages SET text = $1 WHERE id = $2 RETURNING id, chat_id, sender_id, text, created_at', [text, messageId] 
+        );
+
+        const updatedMessageData = updateResult.rows[0];
+
+        const senderLogin = req.user.login;
+
+        updatedMessageData.sender_login = senderLogin;
+
+        res.status(200).json({
+            success: true, 
+            message: 'Message updated successfully',
+            updatedMessageData: updatedMessageData
+        });
+        const updateNotification = {
+            type: 'message_updated',
+            messageData: updatedMessageData
+        }
+        connectedClients.forEach(client => {
+            if(client.readyState === WebSocket.OPEN){
+                client.send(JSON.stringify(updateNotification));
+            }
+        });
+        console.log('WebSocket notification sent:', updateNotification);
+
+    } catch (err) {
+        console.error('Error editing message:', err.stack);
+        res.status(500).json({
+            success: false,
+            message: 'Failed to edit message'
+        });
+    }
+})
+
 
 pool.connect((err, client, release) => {
     if (err) {
