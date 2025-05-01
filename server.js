@@ -190,24 +190,84 @@ app.get(
     '/api/messages',
     authenticateToken,
     async (req, res) => {
+        const chatId = parseInt(req.query.chat_id);
+        const limit = parseInt(req.query.limit) || 50;
+        const beforeId = req.query.before_id ? parseInt(req.query.before_id) : null;
+
+        if (isNaN(chatId)) {
+            return res.status(400).json({ success: false, message: 'chat_id parameter is required and must be a number.' });
+        }
+
+        if (limit < 0 || limit > 100) {
+            return (res.status(400)).json({
+                success: false,
+                message: "Invalid limit parameter"
+            });
+        }
+
+        const userId = req.user.userId;
+
         try {
-            const result = await pool.query(`
+            if (chatId !== 1) {
+                const isParticipant = await pool.query(
+                    'SELECT 1 FROM user_chats WHERE user_id = $1 AND chat_id = $2',
+                    [userId, chatId]
+                );
+
+                if (isParticipant.rows.length === 0) {
+                    return res.status(403).json({
+                        success: false,
+                        message: 'Forbidden: You are not a member of this chat.'
+                    });
+                };
+            }
+            let query = `
                 SELECT
                     m.id,
                     m.text,
                     m.sender_id,
                     u.login as sender_login,
                     m.created_at
-                FROM messages m
-                JOIN users u ON m.sender_id = u.id
-                ORDER BY m.created_at ASC
-                `);
+                FROM 
+                    messages m
+                JOIN
+                    users u ON m.sender_id = u.id
+                WHERE
+                    m.chat_id = $1
+                `;
 
-            res.status(200).json(result.rows);
+            const queryParams = [chatId];
+
+            if (beforeId !== null) {
+                query += ` AND m.id < $${queryParams.length + 1}`;
+                queryParams.push(beforeId);
+            }
+
+            query += ` ORDER BY m.created_at DESC, m.id DESC`;
+            query += ` LIMIT $${queryParams.length + 1}`;
+            queryParams.push(limit + 1)
+
+            console.log(`Executing messages query for chat ${chatId}: ${query, queryParams}`);
+
+            const result = await pool.query(query, queryParams);
+            const messages = result.rows;
+
+            const hasMore = messages.length > limit;
+
+            const messagesToSend = messages.slice(0, limit);
+
+            res.status(200).json({
+                success: true,
+                messages: messagesToSend,
+                hasMore: hasMore
+            });
 
         } catch (err) {
             console.error('Error fetching messages:', err.stack);
-            res.status(500).json({ success: false, message: 'Failed to fetch messages' });
+            res.status(500).json({
+                success: false,
+                message: 'Failed to fetch messages'
+            });
 
         }
     });
@@ -241,8 +301,8 @@ app.post('/api/messages', authenticateToken, async (req, res) => {
         }
 
         const new_message_notification = {
-            type: 'new_message',          
-            messageData: messageDataToBroadcast 
+            type: 'new_message',
+            messageData: messageDataToBroadcast
         };
 
         connectedClients.forEach(client => {
@@ -299,7 +359,7 @@ app.delete('/api/messages/:id', authenticateToken, async (req, res) => {
         };
 
         connectedClients.forEach(client => {
-            if (client.readyState === WebSocket.OPEN){
+            if (client.readyState === WebSocket.OPEN) {
                 client.send(JSON.stringify(deleteNotification));
             }
         });
@@ -356,7 +416,7 @@ app.put('/api/messages/:id', authenticateToken, async (req, res) => {
         }
 
         const updateResult = await pool.query(
-            'UPDATE messages SET text = $1 WHERE id = $2 RETURNING id, chat_id, sender_id, text, created_at', [text, messageId] 
+            'UPDATE messages SET text = $1 WHERE id = $2 RETURNING id, chat_id, sender_id, text, created_at', [text, messageId]
         );
 
         const updatedMessageData = updateResult.rows[0];
@@ -366,7 +426,7 @@ app.put('/api/messages/:id', authenticateToken, async (req, res) => {
         updatedMessageData.sender_login = senderLogin;
 
         res.status(200).json({
-            success: true, 
+            success: true,
             message: 'Message updated successfully',
             updatedMessageData: updatedMessageData
         });
@@ -375,7 +435,7 @@ app.put('/api/messages/:id', authenticateToken, async (req, res) => {
             messageData: updatedMessageData
         }
         connectedClients.forEach(client => {
-            if(client.readyState === WebSocket.OPEN){
+            if (client.readyState === WebSocket.OPEN) {
                 client.send(JSON.stringify(updateNotification));
             }
         });
@@ -389,6 +449,65 @@ app.put('/api/messages/:id', authenticateToken, async (req, res) => {
         });
     }
 })
+
+
+app.get(
+    '/api/chats', 
+    authenticateToken,
+    async (req, res) => {
+        const userId = req.user.userId;
+
+        try {
+            const query = `
+            SELECT 
+                c.id AS chat_id,
+                c.type AS chat_type,
+                c.created_at AS chat_created_at,
+                (SELECT u2.login FROM user_chats uc2 JOIN users u2 ON uc2.user_id = u2.id WHERE uc2.chat_id = c.id AND uc2.user_id != $1 LIMIT 1) AS other_participant_login
+            FROM 
+                user_chats uc
+            JOIN
+                chats c ON uc.chat_id = c.id
+            WHERE
+                uc.user_id = $1
+            ORDER BY 
+                c.created_at DESC;
+            `;
+
+            const result = await pool.query(query, [userId]);
+            const chats = result.rows;
+
+            const formattedChats = chats.map(chat =>{
+                let chatName = `Chat ${chat.chat_id}`;
+
+                if (chat.chat_type === 'personal' && chat.other_participant_login){
+                    chatName = chat.other_participant_login;
+                }else if (chat.chat_id === 1 && chat.other_participant_login){
+                    chatName = 'Public Chat';
+                }
+
+                return {
+                    id: chat.chat_id,
+                    type: chat.chat_type,
+                    name: chatName,
+                    createdAt: chat.chat_created_at
+                }
+            }) 
+
+            res.status(200).json({
+                success: true,
+                chats: formattedChats
+            })
+        } catch (err) {
+            console.error('Error fetching user chats:', err.stack);
+            res.status(500).json({
+                success: false,
+                message: 'Failed to fetch user chats'
+            })
+        }
+    }
+)
+
 
 
 pool.connect((err, client, release) => {
