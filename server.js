@@ -7,6 +7,7 @@ const jwt = require('jsonwebtoken');
 const cors = require('cors');
 const WebSocket = require('ws');
 const http = require('http');
+const { type } = require('os');
 const app = express();
 const port = process.env.PORT || 3001;
 
@@ -62,28 +63,89 @@ function authenticateToken(req, res, next) {
 
 const connectedClients = new Set();
 
+const authenticatedClients = new Set();
+
+
 wss.on('connection', ws => {
     console.log('Client connected via WebSocket');
 
-    connectedClients.add(ws);
+    const handleAuthMessage = message => {
+        let authData;
+        console.log('Client auth via WebSocket');
 
-    ws.on('message', message => {
-        console.log(`Received message from client: ${message}`);
+        try {
+            authData = JSON.parse(message);
+        } catch (err) {
+            console.error('Failed to parse WebSocket auth message', err);
+            ws.send(JSON.stringify({
+                type: 'error',
+                message: 'Invalid JSON format'
+            }));
+            ws.close(1008, 'Invalid message');
+            return
+        }
+
+        if (authData.type === 'auth' && authData.token) {
+            jwt.verify(authData.token, jwtSecret, (err, decoded) => {
+                if (err) {
+                    ws.send(JSON.stringify({
+                        type: 'auth_failed',
+                        message: 'Invalid token'
+                    }));
+                    ws.close(1008, 'Authentication failed');
+                } else {
+                    console.log('WebSocket client authenticated. User ID:', decoded.userId);
+
+                    ws.userId = decoded.userId;
+                    ws.login = decoded.login;
+
+                    authenticatedClients.add(ws);
+                    console.log(`User ${ws.userId} authenticated via WS. Total authenticated clients${Array.from(authenticatedClients)}`);
+
+                    ws.send(JSON.stringify({
+                        type: 'auth_success',
+                        message: 'Authentication successful'
+                    }));
+
+                    ws.off('message', handleAuthMessage);
+                    ws.on('message', handleClientMessage);
+                }
+            })
+
+        } else {
+            console.warn('WebSocket client sent non-auth first message or invalid auth format.');
+            ws.send(JSON.stringify({ type: 'error', message: 'Authentication required as the first message' }));
+            ws.close(1008, 'Authentication required');
+        }
+    };
+
+    ws.once('message', handleAuthMessage);
+
+    const handleClientMessage = message => {
+        if (!ws.userId) {
+            console.warn('Received message from unauthenticated client on handleClientMessage');
+            ws.send(JSON.stringify({ type: 'error', message: 'Authentication required' }));
+            ws.close(1008, 'Authentication required');
+            return;
+        }
+
+        console.log(`Received message from authenticated client (User ${ws.userId}):`, message);
+    };
+
+    ws.on('close', (code, reason) => {
+        console.log(`Client disconnected. Code: ${code}, Reason: ${reason ? reason.toString() : 'N/A'}`);
+        if (ws.userId) {
+            authenticatedClients.delete(ws);
+            console.log(`Authenticated client (User ${ws.userId}) removed. Total authenticated clients: ${authenticatedClients.size}`);
+        } else {
+            console.log(`Unauthenticated client disconnected. Total authenticated clients: ${authenticatedClients.size}`);
+        }
+        
     });
-
-    ws.on('close', () => {
-        console.log('Client disconnected from WebSocket');
-        connectedClients.delete(ws);
-    });
-
 
     ws.on('error', error => {
-        console.log(`WebSocket error: ${error}`);
-        connectedClients.delete(ws);
+        console.log(`WebSocket error: ${error.message}`);
     });
-
-
-
 })
 
 
@@ -247,7 +309,7 @@ app.get(
             query += ` LIMIT $${queryParams.length + 1}`;
             queryParams.push(limit + 1)
 
-            console.log(`Executing messages query for chat ${chatId}: ${query, queryParams}`);
+            console.log(`Executing messages query for chat ${chatId}: ${query}, ${queryParams}`);
 
             const result = await pool.query(query, queryParams);
             const messages = result.rows;
@@ -274,14 +336,31 @@ app.get(
 
 app.post('/api/messages', authenticateToken, async (req, res) => {
     const senderId = req.user.userId;
-    const { text } = req.body;
+    const { text, chatId } = req.body;
 
     if (!text || text.trim().length === 0) {
         return res.status(400).json({ success: false, message: 'message text can not be empty' });
     }
-    const chatId = 1;
+
+    if (isNaN(chatId)) {
+        return res.status(400).json({ success: false, message: 'chat_id parameter is required and must be a number.' });
+    }
 
     try {
+        if (chatId !== 1) {
+            const isParticipant = await pool.query(
+                'SELECT 1 FROM user_chats WHERE user_id = $1 AND chat_id = $2',
+                [senderId, chatId]
+            );
+
+            if (isParticipant.rows.length === 0) {
+                return res.status(403).json({
+                    success: false,
+                    message: 'Forbidden: You are not a member of this chat.'
+                });
+            };
+        }
+
         const result = await pool.query(
             'INSERT INTO messages (chat_id, sender_id, text) VALUES ($1,$2,$3) RETURNING id, chat_id, sender_id, text, created_at',
             [chatId, senderId, text]
@@ -305,9 +384,19 @@ app.post('/api/messages', authenticateToken, async (req, res) => {
             messageData: messageDataToBroadcast
         };
 
-        connectedClients.forEach(client => {
-            if (client.readyState === WebSocket.OPEN) {
+        const participantsResult = await pool.query(
+            'SELECT user_id FROM user_chats WHERE chat_id = $1',
+            [chatId]
+        );
+
+        const participantUserIds = new Set(participantsResult.rows.map(row => row.user_id));
+
+        console.log(`Broadcasting message for chat ${chatId} to participants:`, Array.from(participantUserIds));
+        console.log(Array.from(authenticatedClients));
+        authenticatedClients.forEach(client => {
+            if (client.readyState === WebSocket.OPEN && participantUserIds.has(client.userId)) {
                 client.send(JSON.stringify(new_message_notification));
+                console.log(`Sent message notification to user ${client.userId} for chat: ${chatId}`);
             }
         })
 
@@ -331,7 +420,7 @@ app.delete('/api/messages/:id', authenticateToken, async (req, res) => {
 
     try {
         const messageResult = await pool.query(
-            'SELECT sender_id FROM messages WHERE id = $1',
+            'SELECT sender_id, chat_id FROM messages WHERE id = $1',
             [messageId]
         );
 
@@ -339,35 +428,45 @@ app.delete('/api/messages/:id', authenticateToken, async (req, res) => {
             return res.status(404).json({
                 success: false,
                 message: 'Message not found'
-            })
+            });
         }
 
         const message = messageResult.rows[0];
+        const messageChatId = message.chat_id;
 
-        if (message.sender_id !== userId) {
+        if (String(message.sender_id) !== String(userId)) {
             return res.status(403).json({
                 success: false,
                 message: 'You can only delete your own messages'
-            })
+            });
         }
 
         await pool.query('DELETE FROM messages WHERE id = $1', [messageId]);
 
+        const participantsResult = await pool.query(
+            'SELECT user_id FROM user_chats WHERE chat_id = $1',
+            [messageChatId]
+        );
+        const participantUserIds = new Set(participantsResult.rows.map(row => row.user_id ));
+
         const deleteNotification = {
             type: 'message_deleted',
-            messageId: messageId
+            messageId: messageId,
+            chatId: messageChatId
         };
 
-        connectedClients.forEach(client => {
-            if (client.readyState === WebSocket.OPEN) {
+        authenticatedClients.forEach(client => {
+            if (client.readyState === WebSocket.OPEN && participantUserIds.has(client.userId)) {
                 client.send(JSON.stringify(deleteNotification));
+                console.log(`Sent delete notification for message ${messageId} to user ${client.userId} for chat ${messageChatId}`);
             }
         });
 
         res.status(200).json({
             success: true,
             message: 'Message deleted successfully',
-            id: messageId
+            id: messageId,
+            chatId: messageChatId
         })
 
     } catch (err) {
@@ -393,54 +492,66 @@ app.put('/api/messages/:id', authenticateToken, async (req, res) => {
 
     try {
         const messageResult = await pool.query(
-            'SELECT sender_id FROM messages WHERE id = $1',
+            'SELECT sender_id, chat_id FROM messages WHERE id = $1',
             [messageId]
         );
 
         if (messageResult.rows.length === 0) {
             return res.status(404).json({
                 success: false,
-                success: false,
                 message: 'Message not found'
-            })
-
+            });
         }
 
         const message = messageResult.rows[0];
+        const messageChatId = message.chat_id;
 
         if (message.sender_id !== userId) {
             return res.status(403).json({
                 success: false,
-                message: 'You can only your messages'
-            })
+                message: 'You can only edit your messages'
+            });
         }
 
         const updateResult = await pool.query(
-            'UPDATE messages SET text = $1 WHERE id = $2 RETURNING id, chat_id, sender_id, text, created_at', [text, messageId]
+            'UPDATE messages SET text = $1 WHERE id = $2 RETURNING id, chat_id, sender_id, text, created_at',
+            [text, messageId]
         );
 
         const updatedMessageData = updateResult.rows[0];
 
-        const senderLogin = req.user.login;
+        const senderLoginResult = await pool.query(
+            'SELECT login FROM users WHERE id = $1',
+            [updatedMessageData.sender_id]
+        );
+        updatedMessageData.sender_login = senderLoginResult.rows[0].login;
 
-        updatedMessageData.sender_login = senderLogin;
+        const participantsResult = await pool.query(
+            'SELECT user_id FROM user_chats WHERE chat_id = $1',
+            [messageChatId]
+        );
+        const participantUserIds = new Set(participantsResult.rows.map(row => row.user_id));
 
+        const updateNotification = {
+            type: 'message_updated',
+            messageData: updatedMessageData
+
+        }
+        authenticatedClients.forEach(client => {
+            if (client.readyState === WebSocket.OPEN && participantUserIds.has(client.userId)) {
+                client.send(JSON.stringify(updateNotification));
+                console.log(`Sent update notification for message ${updatedMessageData.id} to user ${client.userId} for chat ${messageChatId}`);
+            }
+        });
+        
+        console.log('WebSocket notification sent:', updateNotification);
+        
         res.status(200).json({
             success: true,
             message: 'Message updated successfully',
             updatedMessageData: updatedMessageData
         });
-        const updateNotification = {
-            type: 'message_updated',
-            messageData: updatedMessageData
-        }
-        connectedClients.forEach(client => {
-            if (client.readyState === WebSocket.OPEN) {
-                client.send(JSON.stringify(updateNotification));
-            }
-        });
-        console.log('WebSocket notification sent:', updateNotification);
-
+        
     } catch (err) {
         console.error('Error editing message:', err.stack);
         res.status(500).json({
@@ -452,7 +563,7 @@ app.put('/api/messages/:id', authenticateToken, async (req, res) => {
 
 
 app.get(
-    '/api/chats', 
+    '/api/chats',
     authenticateToken,
     async (req, res) => {
         const userId = req.user.userId;
@@ -477,12 +588,12 @@ app.get(
             const result = await pool.query(query, [userId]);
             const chats = result.rows;
 
-            const formattedChats = chats.map(chat =>{
+            const formattedChats = chats.map(chat => {
                 let chatName = `Chat ${chat.chat_id}`;
 
-                if (chat.chat_type === 'personal' && chat.other_participant_login){
+                if (chat.chat_type === 'personal' && chat.other_participant_login) {
                     chatName = chat.other_participant_login;
-                }else if (chat.chat_id === 1 && chat.other_participant_login){
+                } else if (chat.chat_id === 1 && chat.other_participant_login) {
                     chatName = 'Public Chat';
                 }
 
@@ -492,7 +603,7 @@ app.get(
                     name: chatName,
                     createdAt: chat.chat_created_at
                 }
-            }) 
+            })
 
             res.status(200).json({
                 success: true,
