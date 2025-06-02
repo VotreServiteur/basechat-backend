@@ -8,6 +8,7 @@ const cors = require('cors');
 const WebSocket = require('ws');
 const http = require('http');
 const { type } = require('os');
+const { send } = require('process');
 const app = express();
 const port = process.env.PORT || 3001;
 
@@ -140,7 +141,7 @@ wss.on('connection', ws => {
         } else {
             console.log(`Unauthenticated client disconnected. Total authenticated clients: ${authenticatedClients.size}`);
         }
-        
+
     });
 
     ws.on('error', error => {
@@ -247,6 +248,8 @@ app.post('/api/auth/login', async (req, res) => {
         res.status(500).json({ success: false, message: 'Login failed' });
     }
 })
+
+
 
 app.get(
     '/api/messages',
@@ -447,7 +450,7 @@ app.delete('/api/messages/:id', authenticateToken, async (req, res) => {
             'SELECT user_id FROM user_chats WHERE chat_id = $1',
             [messageChatId]
         );
-        const participantUserIds = new Set(participantsResult.rows.map(row => row.user_id ));
+        const participantUserIds = new Set(participantsResult.rows.map(row => row.user_id));
 
         const deleteNotification = {
             type: 'message_deleted',
@@ -465,7 +468,7 @@ app.delete('/api/messages/:id', authenticateToken, async (req, res) => {
         res.status(200).json({
             success: true,
             message: 'Message deleted successfully',
-            id: messageId,
+            messageId: messageId,
             chatId: messageChatId
         })
 
@@ -543,15 +546,15 @@ app.put('/api/messages/:id', authenticateToken, async (req, res) => {
                 console.log(`Sent update notification for message ${updatedMessageData.id} to user ${client.userId} for chat ${messageChatId}`);
             }
         });
-        
+
         console.log('WebSocket notification sent:', updateNotification);
-        
+
         res.status(200).json({
             success: true,
             message: 'Message updated successfully',
             updatedMessageData: updatedMessageData
         });
-        
+
     } catch (err) {
         console.error('Error editing message:', err.stack);
         res.status(500).json({
@@ -566,58 +569,212 @@ app.get(
     '/api/chats',
     authenticateToken,
     async (req, res) => {
-        const userId = req.user.userId;
+        const currentUserId = req.user.userId;
 
         try {
-            const query = `
-            SELECT 
-                c.id AS chat_id,
-                c.type AS chat_type,
-                c.created_at AS chat_created_at,
-                (SELECT u2.login FROM user_chats uc2 JOIN users u2 ON uc2.user_id = u2.id WHERE uc2.chat_id = c.id AND uc2.user_id != $1 LIMIT 1) AS other_participant_login
-            FROM 
-                user_chats uc
-            JOIN
-                chats c ON uc.chat_id = c.id
-            WHERE
-                uc.user_id = $1
-            ORDER BY 
-                c.created_at DESC;
-            `;
+            const chatsWithParticipantsAndLastMessageResult = await pool.query(
+                `SELECT
+                c.id,
+                c.type,
+                c.created_at,
+                lm.text AS last_message_text,
+                lm.created_at AS last_message_created_at,
+                
+                CASE
+                    WHEN c.type = 'personal' THEN (
+                    SELECT jsonb_build_object('id', u.id, 'login', u.login)
+                    FROM user_chats uc2
+                    JOIN users u ON uc2.user_id = u.id
+                    WHERE uc2.chat_id = c.id AND uc2.user_id != $1
+                    LIMIT 1
+                    )
+                    ELSE NULL
+                END AS other_participant
+                FROM chats c
+                JOIN user_chats uc1 ON c.id = uc1.chat_id 
+                LEFT JOIN (
+                SELECT
+                    m.chat_id,
+                    m.text,
+                    m.created_at,
+                    ROW_NUMBER() OVER(PARTITION BY m.chat_id ORDER BY m.created_at DESC) as rn
+                FROM messages m
+                ) lm ON c.id = lm.chat_id AND lm.rn = 1
+                WHERE uc1.user_id = $1
+                GROUP BY c.id, c.type, c.created_at, lm.text, lm.created_at 
+                ORDER BY lm.created_at DESC NULLS LAST; 
+            `,
+                [currentUserId]
+            );
 
-            const result = await pool.query(query, [userId]);
-            const chats = result.rows;
 
-            const formattedChats = chats.map(chat => {
-                let chatName = `Chat ${chat.chat_id}`;
-
-                if (chat.chat_type === 'personal' && chat.other_participant_login) {
-                    chatName = chat.other_participant_login;
-                } else if (chat.chat_id === 1 && chat.other_participant_login) {
-                    chatName = 'Public Chat';
-                }
+            const formattedChats = chatsWithParticipantsAndLastMessageResult.rows.map(row => {
+                const chatName = row.type === 'personal' && row.other_participant
+                    ? row.other_participant.login
+                    : `Chat ${row.id}`;
 
                 return {
-                    id: chat.chat_id,
-                    type: chat.chat_type,
+                    id: row.id,
                     name: chatName,
-                    createdAt: chat.chat_created_at
-                }
-            })
+                    type: row.type,
+                    createdAt: row.created_at,
+                    lastMessageText: row.last_message_text,
+                    lastMessageCreatedAt: row.last_message_created_at
+                };
+            });
+
 
             res.status(200).json({
                 success: true,
                 chats: formattedChats
-            })
+            });
+
         } catch (err) {
-            console.error('Error fetching user chats:', err.stack);
+            console.error('Error fetching chats:', err.stack);
             res.status(500).json({
                 success: false,
-                message: 'Failed to fetch user chats'
-            })
+                message: 'Failed to fetch chats.'
+            });
         }
     }
 )
+
+
+app.post('/api/chats', authenticateToken, async (req, res) => {
+    const chatType = 'personal';
+    const otherUserLogin = req.body.otherUserLogin.trim();
+    const currentUserId = req.user.userId;
+    const currentUserLogin = req.user.login.trim();
+
+    if (!otherUserLogin || typeof otherUserLogin !== 'string' || otherUserLogin.length === 0) {
+        return res.status(400).json({
+            success: false,
+            message: 'otherUserLogin is required'
+        });
+    }
+
+    if (otherUserLogin === currentUserLogin) {
+        return res.status(400).json({
+            success: false,
+            message: 'Cannot create a personal chat with yourself'
+        });
+    }
+
+    try {
+
+        const otherUserResult = await pool.query(
+            'SELECT id FROM users WHERE login = $1',
+            [otherUserLogin]
+        );
+
+        if (otherUserResult.rows.length === 0) {
+            return res.status(404).json({
+                success: false,
+                message: `User with login ${otherUserLogin} not found.`
+            });
+        }
+
+        const otherUserId = otherUserResult.rows[0].id;
+
+        const existingChatResult = await pool.query(
+            `SELECT c.id, c.type, c.created_at  
+            FROM user_chats uc1
+            JOIN user_chats uc2 ON uc1.chat_id = uc2.chat_id
+            JOIN chats c ON uc1.chat_id = c.id
+            WHERE uc1.user_id = $1 AND uc2.user_id = $2 AND c.type = $3`,
+            [currentUserId, otherUserId, chatType]
+        );
+
+        if (existingChatResult.rows.length > 0) {
+            const existingChatId = existingChatResult.rows[0].chat_id;
+            console.log(`Personal chat already exists between ${currentUserLogin} and ${otherUserLogin}`);
+
+            return res.status(200).json({
+                success: true,
+                message: 'Personal chat already exists.',
+                chat: {
+                    id: existingChatId,
+                    type: chatType,
+                    name: otherUserLogin
+                }
+            });
+        }
+
+        console.log(`Creating new personal chat between ${currentUserLogin} and ${otherUserLogin}`);
+
+        const client = await pool.connect();
+
+        try {
+            await client.query('BEGIN');
+
+            const newChatResult = await client.query(
+                'INSERT INTO chats (type) VALUES ($1) RETURNING id, type, created_at',
+                [chatType]
+            );
+
+            const newChat = newChatResult.rows[0];
+            const newChatId = newChat.id;
+
+            await client.query(
+                'INSERT INTO user_chats (chat_id, user_id) VALUES ($1, $2), ($1, $3)',
+                [newChatId, currentUserId, otherUserId]
+            );
+
+            await client.query('COMMIT');
+
+            console.log(`New personal chat created with ID: ${newChatId}`);
+
+            const newChatNotification = {
+                type: 'new_chat',
+                chat: {
+                    id: newChatId,
+                    type: newChat.type,
+                    createdAt: newChat.created_at,
+                    participants: [
+                        { id: currentUserId, login: currentUserLogin },
+                        { id: otherUserId, login: otherUserLogin }
+                    ]
+                }
+            };
+
+            Array.from(authenticatedClients)
+                .filter(client => String(client.userId) === String(currentUserId) || String(client.userId) === String(otherUserId))
+                .forEach(client => {
+                    if (client.readyState === WebSocket.OPEN) {
+                        client.send(JSON.stringify(newChatNotification))
+                    }
+                })
+
+
+            const chatName = otherUserLogin;
+            res.status(201).json({
+                success: true,
+                message: 'Personal chat created successfully.',
+                chat: {
+                    id: newChatId,
+                    type: newChat.type,
+                    name: chatName,
+                    createdAt: newChat.created_at
+                }
+            })
+        } catch (transactionErr) {
+            await client.query('ROLLBACK');
+            throw transactionErr;
+        } finally {
+            client.release();
+        }
+    } catch (err) {
+        console.error('Error creating chat:', err.stack);
+        if (!res.headersSent) {
+            res.status(500).json({
+                success: false,
+                message: 'Failed to create chat.'
+            });
+        }
+    }
+
+})
+
 
 
 
