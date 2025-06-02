@@ -314,6 +314,7 @@ app.get(
 
             console.log(`Executing messages query for chat ${chatId}: ${query}, ${queryParams}`);
 
+
             const result = await pool.query(query, queryParams);
             const messages = result.rows;
 
@@ -517,6 +518,7 @@ app.put('/api/messages/:id', authenticateToken, async (req, res) => {
         }
 
         const updateResult = await pool.query(
+
             'UPDATE messages SET text = $1 WHERE id = $2 RETURNING id, chat_id, sender_id, text, created_at',
             [text, messageId]
         );
@@ -774,6 +776,7 @@ app.post('/api/chats', authenticateToken, async (req, res) => {
     }
 
 })
+
 
 
 
